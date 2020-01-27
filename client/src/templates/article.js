@@ -6,7 +6,15 @@ import Layout from '../components/layout'
 const ArticleTemplate = ({ data }) => (
   <Layout>
     <h1>{data.strapiArticles.title}</h1>
-    <p>by <Link to={`/authors/User_${data.strapiArticles.author.id}`}>{data.strapiArticles.author.username}</Link></p>
+    <p>by &nbsp;
+      {
+        data.strapiArticles.author.map(author => (
+          <Link to={`/authors/Users_${author.id}`}>
+            {author.username}
+          </Link>
+        ))
+      }
+    </p>
     <Img fluid={data.strapiArticles.image.childImageSharp.fluid}/>
     <p>{data.strapiArticles.content}</p>
   </Layout>
@@ -25,7 +33,7 @@ export const query = graphql`
             ...GatsbyImageSharpFluid
           }
         }
-        }
+      }
       author {
         id
         username
