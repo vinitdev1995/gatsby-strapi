@@ -1,5 +1,6 @@
-/* global Article */
 'use strict';
+
+/* global Article */
 
 /**
  * Article.js service
@@ -9,11 +10,7 @@
 
 // Public dependencies.
 const _ = require('lodash');
-
-// Strapi utilities.
-const utils = require('strapi-hook-bookshelf/lib/utils/');
 const { convertRestQueryParams, buildQuery } = require('strapi-utils');
-
 
 module.exports = {
 
@@ -24,16 +21,16 @@ module.exports = {
    */
 
   fetchAll: (params, populate) => {
-    // Select field to populate.
-    const withRelated = populate || Article.associations
-      .filter(ast => ast.autoPopulate !== false)
-      .map(ast => ast.alias);
-
     const filters = convertRestQueryParams(params);
+    const populateOpt = populate || Article.associations
+      .filter(ast => ast.autoPopulate !== false)
+      .map(ast => ast.alias)
 
-    return Article.query(buildQuery({ model: Article, filters }))
-      .fetchAll({ withRelated })
-      .then(data => data.toJSON());
+    return buildQuery({
+      model: Article,
+      filters,
+      populate: populateOpt,
+    });
   },
 
   /**
@@ -46,24 +43,28 @@ module.exports = {
     // Select field to populate.
     const populate = Article.associations
       .filter(ast => ast.autoPopulate !== false)
-      .map(ast => ast.alias);
+      .map(ast => ast.alias)
+      .join(' ');
 
-    return Article.forge(_.pick(params, 'id')).fetch({
-      withRelated: populate
-    });
+    return Article
+      .findOne(_.pick(params, _.keys(Article.schema.paths)))
+      .populate(populate);
   },
 
   /**
-   * Promise to count a/an article.
+   * Promise to count articles.
    *
    * @return {Promise}
    */
 
   count: (params) => {
-    // Convert `params` object to filters compatible with Bookshelf.
     const filters = convertRestQueryParams(params);
 
-    return Article.query(buildQuery({ model: Article, filters: _.pick(filters, 'where') })).count();
+    return buildQuery({
+      model: Article,
+      filters: { where: filters.where },
+    })
+      .count()
   },
 
   /**
@@ -78,10 +79,10 @@ module.exports = {
     const data = _.omit(values, Article.associations.map(ast => ast.alias));
 
     // Create entry with no-relational data.
-    const entry = await Article.forge(data).save();
+    const entry = await Article.create(data);
 
     // Create relational data and return the entry.
-    return Article.updateRelations({ id: entry.id , values: relations });
+    return Article.updateRelations({ _id: entry.id, values: relations });
   },
 
   /**
@@ -92,13 +93,13 @@ module.exports = {
 
   edit: async (params, values) => {
     // Extract values related to relational data.
-    const relations = _.pick(values, Article.associations.map(ast => ast.alias));
-    const data = _.omit(values, Article.associations.map(ast => ast.alias));
+    const relations = _.pick(values, Article.associations.map(a => a.alias));
+    const data = _.omit(values, Article.associations.map(a => a.alias));
 
-    // Create entry with no-relational data.
-    const entry = await Article.forge(params).save(data);
+    // Update entry with no-relational data.
+    const entry = await Article.updateOne(params, data, { multi: true });
 
-    // Create relational data and return the entry.
+    // Update relational data and return the entry.
     return Article.updateRelations(Object.assign(params, { values: relations }));
   },
 
@@ -108,28 +109,42 @@ module.exports = {
    * @return {Promise}
    */
 
-  remove: async (params) => {
-    params.values = {};
-    Article.associations.map(association => {
-      switch (association.nature) {
-        case 'oneWay':
-        case 'oneToOne':
-        case 'manyToOne':
-        case 'oneToManyMorph':
-          params.values[association.alias] = null;
-          break;
-        case 'oneToMany':
-        case 'manyToMany':
-        case 'manyToManyMorph':
-          params.values[association.alias] = [];
-          break;
-        default:
-      }
-    });
+  remove: async params => {
+    // Select field to populate.
+    const populate = Article.associations
+      .filter(ast => ast.autoPopulate !== false)
+      .map(ast => ast.alias)
+      .join(' ');
 
-    await Article.updateRelations(params);
+    // Note: To get the full response of Mongo, use the `remove()` method
+    // or add spent the parameter `{ passRawResult: true }` as second argument.
+    const data = await Article
+      .findOneAndRemove(params, {})
+      .populate(populate);
 
-    return Article.forge(params).destroy();
+    if (!data) {
+      return data;
+    }
+
+    await Promise.all(
+      Article.associations.map(async association => {
+        if (!association.via || !data._id || association.dominant) {
+          return true;
+        }
+
+        const search = _.endsWith(association.nature, 'One') || association.nature === 'oneToMany' ? { [association.via]: data._id } : { [association.via]: { $in: [data._id] } };
+        const update = _.endsWith(association.nature, 'One') || association.nature === 'oneToMany' ? { [association.via]: null } : { $pull: { [association.via]: data._id } };
+
+        // Retrieve model.
+        const model = association.plugin ?
+          strapi.plugins[association.plugin].models[association.model || association.collection] :
+          strapi.models[association.model || association.collection];
+
+        return model.update(search, update, { multi: true });
+      })
+    );
+
+    return data;
   },
 
   /**
@@ -139,71 +154,44 @@ module.exports = {
    */
 
   search: async (params) => {
-    // Convert `params` object to filters compatible with Bookshelf.
+    // Convert `params` object to filters compatible with Mongo.
     const filters = strapi.utils.models.convertParams('article', params);
     // Select field to populate.
     const populate = Article.associations
       .filter(ast => ast.autoPopulate !== false)
-      .map(ast => ast.alias);
+      .map(ast => ast.alias)
+      .join(' ');
 
-    const associations = Article.associations.map(x => x.alias);
-    const searchText = Object.keys(Article._attributes)
-      .filter(attribute => attribute !== Article.primaryKey && !associations.includes(attribute))
-      .filter(attribute => ['string', 'text'].includes(Article._attributes[attribute].type));
+    const $or = Object.keys(Article.attributes).reduce((acc, curr) => {
+      switch (Article.attributes[curr].type) {
+        case 'integer':
+        case 'float':
+        case 'decimal':
+          if (!_.isNaN(_.toNumber(params._q))) {
+            return acc.concat({ [curr]: params._q });
+          }
 
-    const searchInt = Object.keys(Article._attributes)
-      .filter(attribute => attribute !== Article.primaryKey && !associations.includes(attribute))
-      .filter(attribute => ['integer', 'decimal', 'float'].includes(Article._attributes[attribute].type));
+          return acc;
+        case 'string':
+        case 'text':
+        case 'password':
+          return acc.concat({ [curr]: { $regex: params._q, $options: 'i' } });
+        case 'boolean':
+          if (params._q === 'true' || params._q === 'false') {
+            return acc.concat({ [curr]: params._q === 'true' });
+          }
 
-    const searchBool = Object.keys(Article._attributes)
-      .filter(attribute => attribute !== Article.primaryKey && !associations.includes(attribute))
-      .filter(attribute => ['boolean'].includes(Article._attributes[attribute].type));
-
-    const query = (params._q || '').replace(/[^a-zA-Z0-9.-\s]+/g, '');
-
-    return Article.query(qb => {
-      if (!_.isNaN(_.toNumber(query))) {
-        searchInt.forEach(attribute => {
-          qb.orWhereRaw(`${attribute} = ${_.toNumber(query)}`);
-        });
+          return acc;
+        default:
+          return acc;
       }
+    }, []);
 
-      if (query === 'true' || query === 'false') {
-        searchBool.forEach(attribute => {
-          qb.orWhereRaw(`${attribute} = ${_.toNumber(query === 'true')}`);
-        });
-      }
-
-      // Search in columns with text using index.
-      switch (Article.client) {
-        case 'mysql':
-          qb.orWhereRaw(`MATCH(${searchText.join(',')}) AGAINST(? IN BOOLEAN MODE)`, `*${query}*`);
-          break;
-        case 'pg': {
-          const searchQuery = searchText.map(attribute =>
-            _.toLower(attribute) === attribute
-              ? `to_tsvector(${attribute})`
-              : `to_tsvector('${attribute}')`
-          );
-
-          qb.orWhereRaw(`${searchQuery.join(' || ')} @@ to_tsquery(?)`, query);
-          break;
-        }
-      }
-
-      if (filters.sort) {
-        qb.orderBy(filters.sort.key, filters.sort.order);
-      }
-
-      if (filters.skip) {
-        qb.offset(_.toNumber(filters.skip));
-      }
-
-      if (filters.limit) {
-        qb.limit(_.toNumber(filters.limit));
-      }
-    }).fetchAll({
-      withRelated: populate
-    });
+    return Article
+      .find({ $or })
+      .sort(filters.sort)
+      .skip(filters.start)
+      .limit(filters.limit)
+      .populate(populate);
   }
 };

@@ -1,14 +1,12 @@
 {
   "connection": "default",
-  "collectionName": "articles",
+  "collectionName": "article",
   "info": {
     "name": "article",
     "description": ""
   },
   "options": {
-    "increments": true,
-    "timestamps": true,
-    "comment": ""
+    "timestamps": true
   },
   "attributes": {
     "title": {

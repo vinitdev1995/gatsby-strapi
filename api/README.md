@@ -1,3 +1,3 @@
-# api
+# strapi-server
 
-A quick description of api.
+A quick description of strapi-server.
